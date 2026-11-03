@@ -1,7 +1,11 @@
 
-    const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby_U-79LipyDQwFtWKEys6M6Dvk6Yd-qbTlDax75ZsGgnB5c321MAvgL-dP-PHWh7k/exec';
+    const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxT0rjaE06apgX19EcbwXdx9-uuiwcSpasUPFDgkJR8ex1pNn7UFps1JBth16uk34Y/exec';
     const SESSION_KEY = 'subcon_auth';
     const MONTH_SHORT = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+    const RMT_PAGE_CONFIG = window.RMT_PAGE_CONFIG || {};
+    const ACTIVE_PLANT_FILTER = String(RMT_PAGE_CONFIG.plantFilter || '').trim().toUpperCase();
+    // CMT is retired: retain historical reports, but hide it unless the selected summary month has records.
+    const RETIRED_SUBCONS = new Set(['CMT']);
     let currentUser = null;
     let deadlineState = {};
     let dashboardDeadlineState = {};
@@ -13,11 +17,18 @@
     let d365SubstockSummaryMap = {};
     let summaryRowsState = [];
     let summaryAllSubconsState = [];
+    let rmtTotalTrendChart = null;
+    let rmtTrendCache = {};
+    let rmtTrendRequests = {};
+    let rmtTrendSeriesState = [];
+    let rmtTrendSubconVisibility = {};
+    let rmtTrendMetricVisibility = { total: true, accuracy: true };
+    let dashboardDisplayPanel = 'status';
     let summaryTopCollapsedState = { subcon: true, plant: true };
     let summaryQtyOverrideState = {};
     let summaryDirtyGroupsState = {};
     let summaryFilterMultiState = {
-      item: [], fileNo: [], d365Code: [], d365Qty: [], d365Diff: [], boh: [], supply: [], delivery: [], ng: [], eoh: [], confirmOk: [], confirmHold: [], total: [], diff: [], remark: [], subcon: [], plant: []
+      item: [], fileNo: [], d365Code: [], d365Qty: [], d365Diff: [], boh: [], supply: [], delivery: [], ng: [], eoh: [], confirmOk: [], confirmFg: [], confirmHold: [], total: [], diff: [], remark: [], subcon: [], plant: []
     };
     let summaryDirty = false;
     let d365FilterState = {
@@ -26,6 +37,52 @@
     let d365FilterMultiState = {
       itemNumber: [], processNo: [], cmt: [], kdt: [], kkft: [], mdi: [], snt: [], ssp: [], skc: [], tpk: [], tisco: [], tyn: [], grandTotal: []
     };
+
+    function isPlantScopedPage() {
+      return ACTIVE_PLANT_FILTER === 'CHP' || ACTIVE_PLANT_FILTER === 'G1P';
+    }
+
+    function isRetiredSubcon(subcon) {
+      return RETIRED_SUBCONS.has(String(subcon || '').trim().toUpperCase());
+    }
+
+    function hydrateFileNoMap(rows = []) {
+      fileNoMapState = {};
+      (rows || []).forEach((row) => {
+        const fileNo = String(row.fileNo || '').trim().toUpperCase();
+        if (!fileNo) return;
+        fileNoMapState[fileNo] = {
+          fileNo,
+          plant: String(row.plant || '').trim().toUpperCase()
+        };
+      });
+    }
+
+    async function ensureFileNoMapState() {
+      if (Object.keys(fileNoMapState).length) return;
+      const res = await api('listFileNoMap', { username: currentUser.username });
+      if (res && res.ok) hydrateFileNoMap(res.rows || []);
+    }
+
+    function rowMatchesActivePlant(row = {}) {
+      if (!isPlantScopedPage()) return true;
+      const mapping = getFileNoMapEntry(row.fileNo);
+      return String(mapping.plant || '').trim().toUpperCase() === ACTIVE_PLANT_FILTER;
+    }
+
+    function filterRowsByActivePlant(rows = []) {
+      return isPlantScopedPage() ? (rows || []).filter(rowMatchesActivePlant) : (rows || []);
+    }
+
+    function d365RowMatchesActivePlant(row = {}) {
+      if (!isPlantScopedPage()) return true;
+      const d365Tail = getD365Tail(row.itemNumber);
+      if (!d365Tail) return false;
+      return Object.values(fileNoMapState).some((mapping) =>
+        String(mapping.plant || '').trim().toUpperCase() === ACTIVE_PLANT_FILTER
+        && getFileNoTail(mapping.fileNo) === d365Tail
+      );
+    }
 
     function swalTheme(base = {}) { return Object.assign({ showCloseButton: true, confirmButtonColor: '#4C6272', background: '#ffffff', color: '#102027' }, base); }
     function swalLoading(title) {
@@ -41,7 +98,13 @@
       const res = await fetch(SCRIPT_URL + '?action=' + encodeURIComponent(action), {
         method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload)
       });
-      return res.json();
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        // Apps Script can return an HTML error page after a server-side timeout.
+        throw new Error(`The data service returned an invalid response (${res.status}).`);
+      }
     }
 
     function safeNum(v) {
@@ -57,9 +120,7 @@
       return safeNum(row.total) - safeNum(row.eoh);
     }
     function getDisplayDiffValue(row = {}) {
-      const explicit = String(row.diff ?? '').trim();
-      if (explicit !== '') return Math.abs(safeNum(row.diff));
-      return Math.abs(getSignedDiffValue(row));
+      return getSignedDiffValue(row);
     }
     function diffClassFromSigned(signed) {
       return signed < 0 ? 'diff-negative' : 'diff-positive';
@@ -67,6 +128,32 @@
     function textOrDash(v) {
       const s = String(v ?? '').trim();
       return s ? s : '-';
+    }
+
+    // Keep spreadsheet calculations usable: visible numeric values must remain
+    // numeric cells in the XLSX export, not formatted text such as "16,547".
+    function excelNumberOrBlank(v) {
+      const raw = String(v ?? '').trim();
+      if (!raw || raw === '-') return '';
+      const n = Number(raw.replace(/,/g, ''));
+      return Number.isFinite(n) ? n : '';
+    }
+
+    function formatSummaryExportNumbers(ws) {
+      if (!ws || !ws['!ref']) return;
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      const numericHeaders = new Set([
+        'Item', "D365 Q'ty", 'Actual', 'Diff', 'BOH', 'Supply', 'Delivery',
+        'NG', 'EOH', 'OK', 'Hold', 'Total', 'Delta +/-'
+      ]);
+      for (let col = range.s.c; col <= range.e.c; col += 1) {
+        const header = ws[XLSX.utils.encode_cell({ r: 0, c: col })]?.v;
+        if (!numericHeaders.has(header)) continue;
+        for (let row = 1; row <= range.e.r; row += 1) {
+          const cell = ws[XLSX.utils.encode_cell({ r: row, c: col })];
+          if (cell && typeof cell.v === 'number') cell.z = '#,##0;[Red]-#,##0;-';
+        }
+      }
     }
     function toSummaryRowKey(row = {}) {
       return [
@@ -102,6 +189,7 @@
       btn.classList.toggle('btn-warning', summaryDirty);
     }
     function isSummaryQtyEditable(fileNo) {
+      if (RMT_PAGE_CONFIG.allowD365QtyEdit === false) return false;
       return /[AB]$/i.test(String(fileNo || '').trim());
     }
 
@@ -121,28 +209,34 @@
       const dash = document.getElementById('dashboardMonthInput');
       const summary = document.getElementById('summaryMonthInput');
       const substock = document.getElementById('substockMonthInput');
-      if (base) base.value = currentMonth;
-      if (menu === 'dashboard' && dash) dash.value = currentMonth;
-      if (menu === 'summary' && summary) summary.value = currentMonth;
-      if (menu === 'd365substock' && substock) substock.value = currentMonth;
-      if (menu === 'dashboard' || menu === 'summary' || menu === 'd365substock') {
-        if (dash && menu !== 'dashboard') dash.value = currentMonth;
-        if (summary && menu !== 'summary') summary.value = currentMonth;
-        if (substock && menu !== 'd365substock') substock.value = currentMonth;
-      }
+      // Keep a selected historical month when navigating between menus.
+      if (base && !base.value) base.value = currentMonth;
+      if (dash && !dash.value) dash.value = base?.value || currentMonth;
+      if (summary && !summary.value) summary.value = base?.value || currentMonth;
+      if (substock && !substock.value) substock.value = base?.value || currentMonth;
       updateDashboardTitle();
     }
 
     function formatDashboardDate(v) {
       const s = String(v || '').trim();
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-      const [y, m, d] = s.split('-').map(Number);
+      const match = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):\d{2}(?::\d{2})?)?$/);
+      if (!match) return s;
+      const [, y, m, d, hour] = match;
       const dt = new Date(y, m - 1, d);
       if (isNaN(dt.getTime())) return s;
       const day = String(dt.getDate()).padStart(2, '0');
       const mon = dt.toLocaleDateString('en-US', { month: 'short' });
       const year = dt.getFullYear();
-      return `${day}-${mon}-${year}`;
+      return `${day}-${mon}-${year}${hour ? ` ${hour}:00` : ''}`;
+    }
+
+    function deadlineEndTime(v) {
+      const s = String(v || '').trim();
+      const match = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):\d{2}(?::\d{2})?)?$/);
+      if (!match) return NaN;
+      const [, y, m, d, hour] = match;
+      // Legacy date-only values retain their original end-of-day behavior.
+      return new Date(Number(y), Number(m) - 1, Number(d), hour === undefined ? 23 : Number(hour), hour === undefined ? 59 : 0, hour === undefined ? 59 : 0).getTime();
     }
 
     function renderDashboardDeadline(month) {
@@ -154,9 +248,9 @@
         return;
       }
       const ddDisplay = formatDashboardDate(dd);
-      const end = new Date(dd + 'T23:59:59');
+      const end = deadlineEndTime(dd);
       const now = new Date();
-      const closed = Number.isFinite(end.getTime()) ? now > end : false;
+      const closed = Number.isFinite(end) ? now.getTime() > end : false;
       const chipClass = closed ? 'closed' : 'open';
       const chipText = closed ? 'CLOSED' : 'OPEN';
       el.innerHTML = `Deadline: <span>${ddDisplay}</span> <span class="chip ${chipClass}">${chipText}</span>`;
@@ -165,9 +259,10 @@
     function updateDashboardTitle() {
       const month = document.getElementById('monthInput').value;
       const label = monthLabel(month);
+      const baseTitle = RMT_PAGE_CONFIG.dashboardTitle || 'RMT Dashboard (Monthly Inventory)';
       document.getElementById('dashboardTitle').textContent = label
-        ? `RMT Dashboard (Monthly Inventory) - ${label}`
-        : 'RMT Dashboard (Monthly Inventory)';
+        ? `${baseTitle} - ${label}`
+        : baseTitle;
     }
 
     function syncDashboardMonthInput() {
@@ -181,10 +276,205 @@
       if (base && summary && summary.value !== base.value) summary.value = base.value || '';
     }
 
+    function getDashboardTrendYear() {
+      const selectedYear = Number(document.getElementById('rmtTrendYearSelect')?.value || 0);
+      if (selectedYear) return selectedYear;
+      const month = String(document.getElementById('dashboardMonthInput')?.value || document.getElementById('monthInput')?.value || '');
+      return Number(month.slice(0, 4)) || new Date().getFullYear();
+    }
+
+    function initRmtTrendYearSelect() {
+      const select = document.getElementById('rmtTrendYearSelect');
+      if (!select) return;
+      const currentYear = new Date().getFullYear();
+      const startYear = Math.min(2020, currentYear);
+      const years = Array.from({ length: currentYear - startYear + 2 }, (_, index) => currentYear + 1 - index);
+      select.innerHTML = years.map((year) => `<option value="${year}">${year}</option>`).join('');
+      select.value = String(currentYear);
+    }
+
+    function getTrendSeriesColor(index) {
+      const colors = ['#2563eb', '#059669', '#d97706', '#7c3aed', '#dc2626', '#0891b2', '#4f46e5', '#65a30d', '#c2410c', '#be123c'];
+      return colors[index % colors.length];
+    }
+
+    function renderRmtTrendControls() {
+      const legend = document.getElementById('rmtTrendSubconLegend');
+      if (legend) {
+        legend.innerHTML = rmtTrendSeriesState.map((entry, index) => {
+          const subcon = String(entry.subcon || '').toUpperCase();
+          const active = rmtTrendSubconVisibility[subcon] !== false;
+          return `<button class="rmt-trend-subcon-toggle ${active ? '' : 'inactive'}" type="button" onclick='toggleRmtTrendSubcon(${JSON.stringify(subcon)})'>
+            <span class="rmt-trend-subcon-dot" style="background:${getTrendSeriesColor(index)};"></span>${subcon}
+          </button>`;
+        }).join('');
+      }
+      document.getElementById('rmtTrendTotalToggle')?.classList.toggle('active', rmtTrendMetricVisibility.total);
+      document.getElementById('rmtTrendAccuracyToggle')?.classList.toggle('active', rmtTrendMetricVisibility.accuracy);
+    }
+
+    function applyRmtTrendVisibility() {
+      if (!rmtTotalTrendChart) return;
+      rmtTrendSeriesState.forEach((entry, index) => {
+        const subcon = String(entry.subcon || '').toUpperCase();
+        const isSubconVisible = rmtTrendSubconVisibility[subcon] !== false;
+        rmtTotalTrendChart.setDatasetVisibility(index * 2, isSubconVisible && rmtTrendMetricVisibility.total);
+        rmtTotalTrendChart.setDatasetVisibility(index * 2 + 1, isSubconVisible && rmtTrendMetricVisibility.accuracy);
+      });
+      rmtTotalTrendChart.update();
+      renderRmtTrendControls();
+    }
+
+    function toggleRmtTrendSubcon(subcon) {
+      const key = String(subcon || '').toUpperCase();
+      rmtTrendSubconVisibility[key] = rmtTrendSubconVisibility[key] === false;
+      applyRmtTrendVisibility();
+    }
+
+    function toggleRmtTrendMetric(metric) {
+      if (metric !== 'total' && metric !== 'accuracy') return;
+      rmtTrendMetricVisibility[metric] = !rmtTrendMetricVisibility[metric];
+      applyRmtTrendVisibility();
+    }
+
+    function switchDashboardPanel(panel) {
+      dashboardDisplayPanel = panel === 'trend' ? 'trend' : 'status';
+      const isTrend = dashboardDisplayPanel === 'trend';
+      document.getElementById('dashboardStatusPanel')?.classList.toggle('hidden', isTrend);
+      document.getElementById('dashboardTrendPanel')?.classList.toggle('hidden', !isTrend);
+      document.getElementById('dashboardTabStatus')?.classList.toggle('active', !isTrend);
+      document.getElementById('dashboardTabTrend')?.classList.toggle('active', isTrend);
+      if (isTrend) loadRmtTotalTrend();
+    }
+
+    function getRmtYearTrend(year, force = false) {
+      if (!force && rmtTrendCache[year]) return Promise.resolve(rmtTrendCache[year]);
+      if (rmtTrendRequests[year]) return rmtTrendRequests[year];
+      const request = api('getRmtYearTrend', { year, username: currentUser.username, force: !!force })
+        .then((result) => {
+          if (result?.ok) rmtTrendCache[year] = result;
+          return result;
+        })
+        .finally(() => {
+          delete rmtTrendRequests[year];
+        });
+      rmtTrendRequests[year] = request;
+      return request;
+    }
+
+    function prefetchRmtTotalTrend() {
+      const year = getDashboardTrendYear();
+      if (rmtTrendCache[year] || rmtTrendRequests[year]) return;
+      // Warm the small annual result after the dashboard is ready, without
+      // blocking cards or displaying a second loading state.
+      getRmtYearTrend(year).catch(() => {});
+    }
+
+    async function loadRmtTotalTrend(force = false) {
+      const canvas = document.getElementById('rmtTotalTrendChart');
+      const loading = document.getElementById('rmtTrendLoading');
+      const label = document.getElementById('rmtTrendYearLabel');
+      if (!canvas || !loading || !label || typeof Chart === 'undefined') return;
+      const year = getDashboardTrendYear();
+      label.textContent = `Year ${year} | Total and %Accuracy by Subcon`;
+      loading.textContent = 'Loading total trend...';
+      loading.classList.remove('hidden');
+      canvas.parentElement.classList.add('hidden');
+      try {
+        const result = await getRmtYearTrend(year, force);
+        if (!result?.ok) throw new Error(result?.message || 'Unable to load total trend');
+        const series = (result.series || []).filter((entry) => !isRetiredSubcon(entry.subcon));
+        rmtTrendSeriesState = series;
+        series.forEach((entry) => {
+          const subcon = String(entry.subcon || '').toUpperCase();
+          if (typeof rmtTrendSubconVisibility[subcon] === 'undefined') rmtTrendSubconVisibility[subcon] = true;
+        });
+        if (rmtTotalTrendChart) rmtTotalTrendChart.destroy();
+        rmtTotalTrendChart = new Chart(canvas, {
+          type: 'bar',
+          data: {
+            labels: MONTH_SHORT.map((m) => m.charAt(0) + m.slice(1).toLowerCase()),
+            datasets: series.flatMap((entry, index) => {
+              const subcon = String(entry.subcon || '').toUpperCase();
+              const color = getTrendSeriesColor(index);
+              return [{
+                type: 'bar',
+                label: `${subcon} Total`,
+                data: Array.isArray(entry.totals) ? entry.totals : Array(12).fill(0),
+                backgroundColor: `${color}cc`,
+                borderColor: color,
+                borderWidth: 1,
+                borderRadius: 4,
+                maxBarThickness: 22,
+                yAxisID: 'y'
+              }, {
+                type: 'line',
+                label: `${subcon} %Accuracy`,
+                data: Array.isArray(entry.accuracies) ? entry.accuracies.map((value) => Number(value || 0) * 100) : Array(12).fill(0),
+                borderColor: color,
+                backgroundColor: color,
+                borderWidth: 2,
+                pointRadius: 3,
+                pointHoverRadius: 5,
+                // Keep 100% markers fully visible above the chart boundary.
+                clip: 6,
+                tension: 0.25,
+                fill: false,
+                yAxisID: 'yAccuracy'
+              }];
+            })
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            // Show details only when the pointer intersects a bar or line point.
+            interaction: { mode: 'nearest', intersect: true },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                displayColors: false,
+                callbacks: {
+                  label: (ctx) => {
+                    const pairStart = Math.floor(ctx.datasetIndex / 2) * 2;
+                    const totalDataset = ctx.chart.data.datasets[pairStart] || {};
+                    const accuracyDataset = ctx.chart.data.datasets[pairStart + 1] || {};
+                    const subcon = String(totalDataset.label || '').replace(/\s+Total$/, '') || 'Subcon';
+                    const total = Number((totalDataset.data || [])[ctx.dataIndex] || 0);
+                    const accuracy = Number((accuracyDataset.data || [])[ctx.dataIndex] || 0);
+                    return [
+                      `${subcon} Total: ${total.toLocaleString('en-US')}`,
+                      `${subcon} %Accuracy: ${accuracy.toFixed(2)}%`
+                    ];
+                  }
+                }
+              }
+            },
+            scales: {
+              x: { grid: { display: false }, ticks: { font: { weight: '700' } } },
+              y: { beginAtZero: true, position: 'left', ticks: { callback: (v) => Number(v).toLocaleString('en-US') } },
+              yAccuracy: {
+                beginAtZero: true,
+                max: 100,
+                position: 'right',
+                grid: { drawOnChartArea: false },
+                ticks: { callback: (v) => `${v}%` }
+              }
+            }
+          }
+        });
+        applyRmtTrendVisibility();
+      } catch (e) {
+        loading.textContent = e.message || 'Unable to load total trend';
+        return;
+      }
+      loading.classList.add('hidden');
+      canvas.parentElement.classList.remove('hidden');
+    }
+
     function renderRows(rows = []) {
       const body = document.getElementById('reportBody');
       if (!rows.length) {
-        body.innerHTML = '<tr><td class="text-center" colspan="12">No data found</td></tr>';
+        body.innerHTML = '<tr><td class="text-center" colspan="13">No data found</td></tr>';
         recalcTotals([]);
         return;
       }
@@ -198,6 +488,7 @@
           <td>${r.ng || ''}</td>
           <td>${r.eoh || ''}</td>
           <td>${r.confirmOk || ''}</td>
+          <td>${r.confirmFg || ''}</td>
           <td>${r.confirmHold || ''}</td>
           <td>${r.total || ''}</td>
           <td class="diff-cell ${diffClassFromSigned(getSignedDiffValue(r))}">${formatNumOrDash(getDisplayDiffValue(r))}</td>
@@ -208,7 +499,7 @@
     }
 
     function recalcTotals(rows = []) {
-      let boh = 0, supply = 0, delivery = 0, ng = 0, eoh = 0, ok = 0, hold = 0, total = 0, diff = 0;
+      let boh = 0, supply = 0, delivery = 0, ng = 0, eoh = 0, ok = 0, fg = 0, hold = 0, total = 0, diff = 0;
       rows.forEach((r) => {
         boh += safeNum(r.boh);
         supply += safeNum(r.supply);
@@ -216,6 +507,7 @@
         ng += safeNum(r.ng);
         eoh += safeNum(r.eoh);
         ok += safeNum(r.confirmOk);
+        fg += safeNum(r.confirmFg);
         hold += safeNum(r.confirmHold);
         total += safeNum(r.total);
         diff += getSignedDiffValue(r);
@@ -226,6 +518,7 @@
       document.getElementById('sumNg').textContent = formatNumOrDash(ng);
       document.getElementById('sumEoh').textContent = formatNumOrDash(eoh);
       document.getElementById('sumConfirmOk').textContent = formatNumOrDash(ok);
+      document.getElementById('sumConfirmFg').textContent = formatNumOrDash(fg);
       document.getElementById('sumConfirmHold').textContent = formatNumOrDash(hold);
       document.getElementById('sumTotal').textContent = formatNumOrDash(total);
       const sumDiffEl = document.getElementById('sumDiff');
@@ -237,7 +530,9 @@
     async function loadReport() {
       const month = document.getElementById('monthInput').value;
       if (!month) return Swal.fire(swalTheme({ icon: 'warning', title: 'Please select a month' }));
-      const subcon = document.getElementById('subconSelect').value || 'ALL';
+      const subconSelect = document.getElementById('subconSelect');
+      if (!subconSelect) return;
+      const subcon = subconSelect.value || 'ALL';
       if (!subcon || subcon === '__SELECT__' || subcon === '__LOADING__') {
         renderRows([]);
         return;
@@ -245,10 +540,13 @@
 
       Swal.fire(swalLoading('Loading data...'));
       try {
-        const res = await api('getReport', { month, subcon, role: currentUser.role, username: currentUser.username });
+        const [res] = await Promise.all([
+          api('getReport', { month, subcon, role: currentUser.role, username: currentUser.username }),
+          isPlantScopedPage() ? ensureFileNoMapState() : Promise.resolve()
+        ]);
         Swal.close();
         if (!res.ok) return Swal.fire(swalTheme({ icon: 'error', title: res.message || 'Failed to load data' }));
-        const rows = res.rows || [];
+        const rows = filterRowsByActivePlant(res.rows || []);
         renderRows(rows);
       } catch (e) {
         Swal.close();
@@ -265,10 +563,13 @@
       }
       cards.innerHTML = '<div class="subcon-card">Loading data...</div>';
       try {
-        const [dataRes, dlRes] = await Promise.all([
+        const [dataRes, dlRes, mapRes, reportRes] = await Promise.all([
           api('getDashboard', { month, username: currentUser.username }),
-          api('listDeadlines', { username: currentUser.username })
+          api('listDeadlines', { username: currentUser.username }),
+          isPlantScopedPage() ? api('listFileNoMap', { username: currentUser.username }) : Promise.resolve(null),
+          isPlantScopedPage() ? api('getReport', { month, subcon: 'ALL', role: currentUser.role, username: currentUser.username }) : Promise.resolve(null)
         ]);
+        if (mapRes && mapRes.ok) hydrateFileNoMap(mapRes.rows || []);
         dashboardDeadlineState = (dlRes && dlRes.ok && dlRes.deadlines) ? dlRes.deadlines : {};
         renderDashboardDeadline(month);
         if (!dataRes || !dataRes.ok) {
@@ -280,8 +581,42 @@
           return;
         }
 
-        const summary = dataRes.summary || {};
-        const statusRows = dataRes.statusRows || [];
+        let summary = dataRes.summary || {};
+        let statusRows = dataRes.statusRows || [];
+        if (isPlantScopedPage() && reportRes && reportRes.ok) {
+          const scopedRows = filterRowsByActivePlant(reportRes.rows || []);
+          const totalsBySubcon = scopedRows.reduce((acc, row) => {
+            const subcon = String(row.subcon || '').trim().toUpperCase();
+            if (!subcon) return acc;
+            if (!acc[subcon]) acc[subcon] = { count: 0, totalValue: 0 };
+            acc[subcon].count += 1;
+            acc[subcon].totalValue += safeNum(row.total);
+            return acc;
+          }, {});
+          statusRows = (statusRows || []).map((row) => {
+            const subcon = String(row.subcon || '').trim().toUpperCase();
+            const scoped = totalsBySubcon[subcon] || { count: 0, totalValue: 0 };
+            return Object.assign({}, row, {
+              status: scoped.count ? 'submitted' : 'pending',
+              totalValue: scoped.totalValue
+            });
+          });
+          const submitted = statusRows.filter((row) => row.status === 'submitted').length;
+          summary = {
+            totalSub: statusRows.length,
+            submitted,
+            pending: Math.max(0, statusRows.length - submitted),
+            grandTotal: scopedRows.reduce((sum, row) => sum + safeNum(row.total), 0)
+          };
+        }
+        // CMT is no longer active, so it must not appear as a pending/current Dashboard card.
+        statusRows = statusRows.filter((row) => !isRetiredSubcon(row.subcon));
+        summary = {
+          totalSub: statusRows.length,
+          submitted: statusRows.filter((row) => row.status === 'submitted').length,
+          pending: statusRows.filter((row) => row.status !== 'submitted').length,
+          grandTotal: statusRows.reduce((sum, row) => sum + safeNum(row.totalValue), 0)
+        };
         document.getElementById('dashTotalSub').textContent = String(summary.totalSub || 0);
         document.getElementById('dashSubmitted').textContent = String(summary.submitted || 0);
         document.getElementById('dashPending').textContent = String(summary.pending || 0);
@@ -317,11 +652,15 @@
       }
       finally {
         if (showLoadingSwal) Swal.close();
+        // Start the annual aggregation after visible dashboard content is ready.
+        // The Total Trend tab can then render from browser memory immediately.
+        setTimeout(prefetchRmtTotalTrend, 200);
       }
     }
 
     async function refreshDashboard() {
       await loadDashboard(true);
+      if (dashboardDisplayPanel === 'trend') await loadRmtTotalTrend(true);
     }
 
     async function openSubconDashboardSwal(subcon) {
@@ -329,13 +668,16 @@
       if (!subcon || !month) return;
       Swal.fire(swalLoading(`Loading ${String(subcon).toUpperCase()}...`));
       try {
-        const res = await api('getReport', { month, subcon, role: currentUser.role, username: currentUser.username });
+        const [res] = await Promise.all([
+          api('getReport', { month, subcon, role: currentUser.role, username: currentUser.username }),
+          isPlantScopedPage() ? ensureFileNoMapState() : Promise.resolve()
+        ]);
         if (!res || !res.ok) {
           Swal.close();
           return Swal.fire(swalTheme({ icon: 'error', title: (res && res.message) || 'Failed to load data' }));
         }
-        const rows = res.rows || [];
-        let boh = 0, supply = 0, delivery = 0, ng = 0, eoh = 0, ok = 0, hold = 0, total = 0, diff = 0;
+        const rows = filterRowsByActivePlant(res.rows || []);
+        let boh = 0, supply = 0, delivery = 0, ng = 0, eoh = 0, ok = 0, fg = 0, hold = 0, total = 0, diff = 0;
         rows.forEach((r) => {
           boh += safeNum(r.boh);
           supply += safeNum(r.supply);
@@ -343,6 +685,7 @@
           ng += safeNum(r.ng);
           eoh += safeNum(r.eoh);
           ok += safeNum(r.confirmOk);
+          fg += safeNum(r.confirmFg);
           hold += safeNum(r.confirmHold);
           total += safeNum(r.total);
           diff += getSignedDiffValue(r);
@@ -360,10 +703,11 @@
                 <col style="width:6%;">
                 <col style="width:7%;">
                 <col style="width:8%;">
+                <col style="width:7%;">
                 <col style="width:8%;">
                 <col style="width:7%;">
                 <col style="width:7%;">
-                <col style="width:24%;">
+                <col style="width:17%;">
               </colgroup>
               <thead>
                 <tr>
@@ -374,10 +718,11 @@
                   <th>Delivery</th>
                   <th>NG</th>
                   <th>EOH</th>
-                  <th>Supplier confirm OK</th>
+                  <th>Supplier confirm RM/WIP</th>
+                  <th>Supplier confirm FG</th>
                   <th>Supplier confirm Hold</th>
                   <th>Total</th>
-                  <th>Diff</th>
+                  <th>Delta +/-</th>
                   <th>Remark</th>
                 </tr>
               </thead>
@@ -392,12 +737,13 @@
                     <td>${textOrDash(r.ng)}</td>
                     <td>${textOrDash(r.eoh)}</td>
                     <td>${textOrDash(r.confirmOk)}</td>
+                    <td>${textOrDash(r.confirmFg)}</td>
                     <td>${textOrDash(r.confirmHold)}</td>
                     <td>${textOrDash(r.total)}</td>
                     <td class="diff-cell ${diffClassFromSigned(getSignedDiffValue(r))}">${formatNumOrDash(getDisplayDiffValue(r))}</td>
                     <td style="text-align:left;">${textOrDash(r.remark)}</td>
                   </tr>
-                `).join('') : '<tr><td colspan="12" class="text-center">No data found</td></tr>'}
+                `).join('') : '<tr><td colspan="13" class="text-center">No data found</td></tr>'}
               </tbody>
               <tfoot>
                 <tr>
@@ -409,6 +755,7 @@
                   <td>${formatNumOrDash(ng)}</td>
                   <td>${formatNumOrDash(eoh)}</td>
                   <td>${formatNumOrDash(ok)}</td>
+                  <td>${formatNumOrDash(fg)}</td>
                   <td>${formatNumOrDash(hold)}</td>
                   <td>${formatNumOrDash(total)}</td>
                   <td class="${diffClassFromSigned(diff)}">${formatNumOrDash(diff)}</td>
@@ -454,10 +801,14 @@
     }
 
     function formatDeadlineDate(v) {
-      if (!v) return 'Not set';
-      const d = new Date(v);
+      const raw = String(v || '').trim();
+      if (!raw) return 'Not set';
+      const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):\d{2}(?::\d{2})?)?$/);
+      if (!match) return raw;
+      const [, y, m, day, hour] = match;
+      const d = new Date(Number(y), Number(m) - 1, Number(day));
       if (isNaN(d.getTime())) return v;
-      return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`;
+      return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}${hour ? ` ${hour}:00` : ''}`;
     }
 
     function safePct(a, b) {
@@ -624,6 +975,7 @@
             ng: '',
             eoh: '',
             confirmOk: '',
+            confirmFg: '',
             confirmHold: '',
             total: '',
             diff: '',
@@ -703,7 +1055,7 @@
       const filteredRows = applySummaryFilter(rows || []);
       if (!filteredRows.length && !allSubcons.length) {
         setSummaryDirtyState(false);
-        body.innerHTML = '<tr><td class="text-center" colspan="24">No data found</td></tr>';
+        body.innerHTML = '<tr><td class="text-center" colspan="26">No data found</td></tr>';
         return;
       }
       const grouped = filteredRows.reduce((acc, r) => {
@@ -714,7 +1066,7 @@
       }, {});
       const keys = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
       if (!keys.length) {
-        body.innerHTML = '<tr><td class="text-center" colspan="24">No matching records found</td></tr>';
+        body.innerHTML = '<tr><td class="text-center" colspan="26">No matching records found</td></tr>';
         return;
       }
 
@@ -733,14 +1085,14 @@
         let diffItem = 0;
 
         html += `<tr>
-          <td colspan="24" style="background:#e2e8f0; font-weight:800; text-align:left; cursor:pointer;" onclick="toggleSummaryGroup('${groupId}')">
+          <td colspan="26" style="background:#e2e8f0; font-weight:800; text-align:left; cursor:pointer;" onclick="toggleSummaryGroup('${groupId}')">
             <span id="sumToggle_${groupId}" style="display:inline-block; width:20px;">${summaryCollapsedState[groupId] ? '+' : '-'}</span>SUBCON: ${subUpper}
           </td>
         </tr>`;
         html += gRows.map((r, i) => {
           const m = getFileNoMapEntry(r.fileNo);
           const totalD365 = normalizeSummaryQtyValue(r.__d365Qty);
-          const totalSubc = safeNum(r.confirmOk) + safeNum(r.confirmHold);
+          const totalSubc = safeNum(r.confirmOk) + safeNum(r.confirmFg) + safeNum(r.confirmHold);
           const hasComparableD365 = hasComparableSummaryD365(r, totalD365);
           const diffQty = hasComparableD365 ? getSummaryDisplayDiff(totalD365, r) : null;
           const d365Code = resolveDisplayD365Code(r.fileNo);
@@ -771,6 +1123,7 @@
                   >
                 ` : `<span>${formatNumOrDash(totalD365)}</span>`}
               </td>
+              <td>${r.total || '-'}</td>
               <td>${diffQty === null ? '-' : formatNumOrDash(diffQty)}</td>
               <td>${r.boh || '-'}</td>
               <td>${r.supply || '-'}</td>
@@ -778,6 +1131,7 @@
               <td>${r.ng || '-'}</td>
               <td>${r.eoh || '-'}</td>
               <td>${r.confirmOk || '-'}</td>
+              <td>${r.confirmFg || '-'}</td>
               <td>${r.confirmHold || '-'}</td>
               <td>${r.total || '-'}</td>
               <td>${r.diff || '-'}</td>
@@ -798,7 +1152,7 @@
         if (!gRows.length) {
           html += `
             <tr data-summary-group="${groupId}" style="${summaryCollapsedState[groupId] ? 'display:none;' : ''}">
-              <td colspan="24" class="text-center" style="color:#64748b;">No data submitted</td>
+              <td colspan="26" class="text-center" style="color:#64748b;">No data submitted</td>
             </tr>
           `;
         }
@@ -807,7 +1161,7 @@
         const accPct = safePct(okItem, totalItem);
         html += `
           <tr data-summary-group="${groupId}" style="background:#f8fafc; font-weight:700; ${summaryCollapsedState[groupId] ? 'display:none;' : ''}">
-            <td colspan="16" style="text-align:right;">Total (${subUpper})</td>
+            <td colspan="18" style="text-align:right;">Total (${subUpper})</td>
             <td>${formatNumOrDash(sumTotalD365)}</td>
             <td>${formatNumOrDash(sumTotalSubc)}</td>
             <td>${qtyPct}</td>
@@ -1058,6 +1412,7 @@
         case 'ng': return textOrDash(row.ng);
         case 'eoh': return textOrDash(row.eoh);
         case 'confirmOk': return textOrDash(row.confirmOk);
+        case 'confirmFg': return textOrDash(row.confirmFg);
         case 'confirmHold': return textOrDash(row.confirmHold);
         case 'total': return textOrDash(row.total);
         case 'diff': return textOrDash(row.diff);
@@ -1098,7 +1453,7 @@
         if (!byPlant[plant]) byPlant[plant] = { d365: 0, subc: 0, totalItem: 0, okItem: 0, diffItem: 0 };
         if (!bySubcon[subcon]) bySubcon[subcon] = { d365: 0, subc: 0, totalItem: 0, okItem: 0, diffItem: 0 };
         const d365Qty = getSummaryRowD365Qty(r);
-        const subcQty = safeNum(r.confirmOk) + safeNum(r.confirmHold);
+        const subcQty = safeNum(r.confirmOk) + safeNum(r.confirmFg) + safeNum(r.confirmHold);
         const diffQty = getSummaryRowD365Diff(r);
         const isOk = diffQty === null || diffQty === 0;
 
@@ -1202,17 +1557,19 @@
           Item: idx + 1,
           'File No.': textOrDash(r.fileNo),
           'D365 code': d365Code.text,
-          "D365 Q'ty": d365Qty || '',
+          "D365 Q'ty": excelNumberOrBlank(d365Qty),
+          Actual: excelNumberOrBlank(r.total),
           Diff: d365Diff === null ? '' : d365Diff,
-          BOH: textOrDash(r.boh),
-          Supply: textOrDash(r.supply),
-          Delivery: textOrDash(r.delivery),
-          NG: textOrDash(r.ng),
-          EOH: textOrDash(r.eoh),
-          OK: textOrDash(r.confirmOk),
-          Hold: textOrDash(r.confirmHold),
-          Total: textOrDash(r.total),
-          'Diff (Subcon)': textOrDash(r.diff),
+          BOH: excelNumberOrBlank(r.boh),
+          Supply: excelNumberOrBlank(r.supply),
+          Delivery: excelNumberOrBlank(r.delivery),
+          NG: excelNumberOrBlank(r.ng),
+          EOH: excelNumberOrBlank(r.eoh),
+          'RM/WIP': excelNumberOrBlank(r.confirmOk),
+          FG: excelNumberOrBlank(r.confirmFg),
+          Hold: excelNumberOrBlank(r.confirmHold),
+          Total: excelNumberOrBlank(r.total),
+          'Delta +/-': excelNumberOrBlank(r.diff),
           Remark: textOrDash(r.remark),
           SUBC: textOrDash(String(r.subcon || '').toUpperCase()),
           Plant: getSummaryRowPlant(r),
@@ -1339,6 +1696,7 @@
       const wb = XLSX.utils.book_new();
       const wsTop = XLSX.utils.json_to_sheet(topRows);
       const wsDetail = XLSX.utils.json_to_sheet(detailRows);
+      formatSummaryExportNumbers(wsDetail);
       XLSX.utils.book_append_sheet(wb, wsTop, 'Summary Top');
       XLSX.utils.book_append_sheet(wb, wsDetail, 'Summary Detail');
       const stamp = new Date();
@@ -1480,13 +1838,16 @@
       }
       Swal.fire(swalLoading('Loading D365 Substock data...'));
       try {
-        const res = await api('getD365Substock', { username: currentUser.username, month: targetMonth });
+        const [res] = await Promise.all([
+          api('getD365Substock', { username: currentUser.username, month: targetMonth }),
+          isPlantScopedPage() ? ensureFileNoMapState() : Promise.resolve()
+        ]);
         Swal.close();
         if (!res || !res.ok) {
           renderD365SubstockRows([]);
           return Swal.fire(swalTheme({ icon: 'error', title: (res && res.message) || 'Failed to load D365 Substock data' }));
         }
-        d365SubstockRowsState = res.rows || [];
+        d365SubstockRowsState = (res.rows || []).filter(d365RowMatchesActivePlant);
         renderD365SubstockRows(d365SubstockRowsState);
       } catch (e) {
         Swal.close();
@@ -1538,8 +1899,8 @@
           Swal.close();
           return Swal.fire(swalTheme({ icon: 'error', title: (saveRes && saveRes.message) || 'Failed to save D365 Substock data' }));
         }
-        d365SubstockRowsState = normalized;
-        renderD365SubstockRows(normalized);
+        d365SubstockRowsState = normalized.filter(d365RowMatchesActivePlant);
+        renderD365SubstockRows(d365SubstockRowsState);
         Swal.close();
         await Swal.fire(swalTheme({
           icon: 'success',
@@ -1591,7 +1952,7 @@
         if (!bySubcon[subcon]) bySubcon[subcon] = { d365: 0, subc: 0, totalItem: 0, okItem: 0, diffItem: 0 };
 
         const d365Qty = normalizeSummaryQtyValue(r.__d365Qty);
-        const subcQty = safeNum(r.confirmOk) + safeNum(r.confirmHold);
+        const subcQty = safeNum(r.confirmOk) + safeNum(r.confirmFg) + safeNum(r.confirmHold);
         const hasComparableD365 = hasComparableSummaryD365(r, d365Qty);
         const diffQty = hasComparableD365 ? getSummaryDisplayDiff(d365Qty, r) : null;
         const isOk = diffQty === null || diffQty === 0;
@@ -1710,28 +2071,27 @@
       if (icon) icon.textContent = summaryTopCollapsedState[section] ? '+' : '-';
     }
 
-    async function loadSummaryReport() {
-      const month = document.getElementById('monthInput').value;
+    async function loadSummaryReport(monthOverride = '') {
+      const baseMonth = document.getElementById('monthInput');
+      const summaryMonth = document.getElementById('summaryMonthInput');
+      const month = String(monthOverride || summaryMonth?.value || baseMonth?.value || '').trim();
       if (!month) return;
+      if (baseMonth) baseMonth.value = month;
+      if (summaryMonth) summaryMonth.value = month;
       Swal.fire(swalLoading('Loading summary report...'));
       try {
-        const [res, mapRes, dashRes, d365Res, overrideRes] = await Promise.all([
-          api('getReport', { month, subcon: 'ALL', role: currentUser.role, username: currentUser.username }),
-          api('listFileNoMap', { username: currentUser.username }),
-          api('getDashboard', { month, username: currentUser.username }),
-          api('getD365Substock', { month, username: currentUser.username }),
-          api('getSummaryD365QtyOverrides', { month, username: currentUser.username })
-        ]);
+        const summaryRes = await api('getSummaryReportData', { month, username: currentUser.username });
         Swal.close();
-        if (!res.ok) return Swal.fire(swalTheme({ icon: 'error', title: res.message || 'Failed to load summary report' }));
-        fileNoMapState = {};
-        if (mapRes && mapRes.ok) {
-          (mapRes.rows || []).forEach((x) => {
-            const k = String(x.fileNo || '').trim();
-            if (!k) return;
-            fileNoMapState[k] = { plant: x.plant || '' };
-          });
+        if (!summaryRes || !summaryRes.ok) {
+          return Swal.fire(swalTheme({ icon: 'error', title: summaryRes?.message || 'Failed to load summary report' }));
         }
+        const res = summaryRes.report || {};
+        const mapRes = summaryRes.map || {};
+        const dashRes = summaryRes.dashboard || {};
+        const d365Res = summaryRes.d365 || {};
+        const overrideRes = summaryRes.overrides || {};
+        if (!res.ok) return Swal.fire(swalTheme({ icon: 'error', title: res.message || 'Failed to load summary report' }));
+        if (mapRes && mapRes.ok) hydrateFileNoMap(mapRes.rows || []);
         summaryQtyOverrideState = {};
         summaryDirtyGroupsState = {};
         if (overrideRes && overrideRes.ok) {
@@ -1746,17 +2106,26 @@
             summaryQtyOverrideState[key] = normalizeSummaryQtyValue(x.d365Qty);
           });
         }
-        d365SubstockRowsState = (d365Res && d365Res.ok && Array.isArray(d365Res.rows)) ? d365Res.rows : [];
+        d365SubstockRowsState = (d365Res && d365Res.ok && Array.isArray(d365Res.rows))
+          ? d365Res.rows.filter(d365RowMatchesActivePlant)
+          : [];
         buildD365SubstockSummaryMap(d365SubstockRowsState);
         const allSubcons = (dashRes && dashRes.ok)
           ? Array.from(new Set((dashRes.statusRows || []).map(x => String(x.subcon || '').trim()).filter(Boolean)))
           : Array.from(new Set((currentUser.subconList || []).map(s => String(s || '').trim()).filter(Boolean)));
-        summaryAllSubconsState = allSubcons;
-        summaryRowsState = buildSummaryRows(res.rows || [], allSubcons);
+        const reportRows = res.rows || [];
+        const subconsWithDataThisMonth = new Set(reportRows.map((row) => String(row.subcon || '').trim().toUpperCase()).filter(Boolean));
+        const visibleSummarySubcons = allSubcons.filter((subcon) =>
+          !isRetiredSubcon(subcon) || subconsWithDataThisMonth.has(String(subcon || '').trim().toUpperCase())
+        );
+        summaryRowsState = filterRowsByActivePlant(buildSummaryRows(reportRows, visibleSummarySubcons));
+        summaryAllSubconsState = isPlantScopedPage()
+          ? Array.from(new Set(summaryRowsState.map((row) => String(row.subcon || '').trim()).filter(Boolean)))
+          : visibleSummarySubcons;
         setSummaryDirtyState(false);
         updateSummaryFilterHeaderState();
         renderSummaryTop(summaryRowsState);
-        renderSummaryRows(summaryRowsState, allSubcons);
+        renderSummaryRows(summaryRowsState, summaryAllSubconsState);
       } catch (e) {
         Swal.close();
         Swal.fire(swalTheme({ icon: 'error', title: 'Failed to load summary report', text: e.message }));
@@ -1861,7 +2230,10 @@
         const res = await api('listFileNoMap', { username: currentUser.username });
         Swal.close();
         if (!res.ok) return Swal.fire(swalTheme({ icon: 'error', title: res.message || 'Failed to load File No mapping' }));
-        fileNoRowsState = res.rows || [];
+        hydrateFileNoMap(res.rows || []);
+        fileNoRowsState = isPlantScopedPage()
+          ? (res.rows || []).filter((row) => String(row.plant || '').trim().toUpperCase() === ACTIVE_PLANT_FILTER)
+          : (res.rows || []);
         applyFileNoFilter();
       } catch (e) {
         Swal.close();
@@ -1871,7 +2243,8 @@
 
     async function openFileNoSwal(fileNo = '', plant = '') {
       const isEdit = !!fileNo;
-      const plantVal = String(plant || '').trim().toUpperCase();
+      const fixedPlant = isPlantScopedPage() ? ACTIVE_PLANT_FILTER : '';
+      const plantVal = fixedPlant || String(plant || '').trim().toUpperCase();
       const rs = await Swal.fire(swalTheme({
         title: isEdit ? 'Edit File No.' : 'Add File No.',
         html: `
@@ -1879,7 +2252,7 @@
             <label class="form-label fw-semibold mb-1">File No</label>
             <input id="swFileNo" class="form-control mb-2" value="${fileNo || ''}" ${isEdit ? 'disabled' : ''}>
             <label class="form-label fw-semibold mb-1">Plant</label>
-            <select id="swPlant" class="form-select mb-2">
+            <select id="swPlant" class="form-select mb-2" ${fixedPlant ? 'disabled' : ''}>
               <option value="">Select Plant</option>
               <option value="CHP" ${plantVal === 'CHP' ? 'selected' : ''}>CHP</option>
               <option value="G1P" ${plantVal === 'G1P' ? 'selected' : ''}>G1P</option>
@@ -1891,7 +2264,7 @@
         cancelButtonText: 'Cancel',
         preConfirm: () => {
           const vFileNo = (document.getElementById('swFileNo').value || '').trim();
-          const vPlant = (document.getElementById('swPlant').value || '').trim().toUpperCase();
+          const vPlant = fixedPlant || (document.getElementById('swPlant').value || '').trim().toUpperCase();
           if (!vFileNo) {
             Swal.showValidationMessage('Please enter File No');
             return false;
@@ -2012,16 +2385,24 @@
     async function openDeadlineSwal(monthKey) {
       const currentVal = deadlineState[monthKey] || '';
       const [yy, mm] = (monthKey || '').split('-').map(Number);
-      const defaultDate = currentVal || `${monthKey}-01`;
+      const currentMatch = String(currentVal).match(/^(\d{4}-\d{2}-\d{2})(?:T(\d{2}):\d{2}(?::\d{2})?)?$/);
+      const defaultDate = currentMatch ? currentMatch[1] : `${monthKey}-01`;
+      const defaultHour = currentMatch ? (currentMatch[2] || '23') : '23';
       const monthStart = `${monthKey}-01`;
       const monthEnd = `${monthKey}-${String(new Date(yy, mm, 0).getDate()).padStart(2, '0')}`;
+      const hourOptions = Array.from({ length: 24 }, (_, hour) => {
+        const value = String(hour).padStart(2, '0');
+        return `<option value="${value}" ${value === defaultHour ? 'selected' : ''}>${value}:00</option>`;
+      }).join('');
       const rs = await Swal.fire(swalTheme({
         title: `Set deadline (${monthKeyToShortLabel(monthKey)})`,
         html: `
           <input id="swDeadlineDate" type="hidden" value="${currentVal}">
           <div class="deadline-modal-wrap">
-            <div class="deadline-modal-note">Select the final submission date for this month.</div>
+            <div class="deadline-modal-note">Select the final submission date and hour for all Subcons.</div>
             <div id="swDeadlineCalendar"></div>
+            <label class="deadline-hour-label" for="swDeadlineHour">Final submission hour</label>
+            <select id="swDeadlineHour" class="form-select deadline-hour-select">${hourOptions}</select>
           </div>
         `,
         customClass: {
@@ -2049,7 +2430,11 @@
           });
           if (!currentVal) document.getElementById('swDeadlineDate').value = '';
         },
-        preConfirm: () => (document.getElementById('swDeadlineDate').value || '').trim()
+        preConfirm: () => {
+          const date = (document.getElementById('swDeadlineDate').value || '').trim();
+          const hour = (document.getElementById('swDeadlineHour').value || '').trim();
+          return date && /^\d{2}$/.test(hour) ? `${date}T${hour}:00:00` : '';
+        }
       }));
       if (rs.isConfirmed) {
         deadlineState[monthKey] = rs.value || '';
@@ -2095,21 +2480,24 @@
       }
 
       document.getElementById('dashboardView').classList.toggle('hidden', !isDashboard);
-      document.getElementById('searchView').classList.add('hidden');
+      document.getElementById('searchView')?.classList.add('hidden');
       document.getElementById('summaryView').classList.toggle('hidden', !isSummary);
       document.getElementById('settingView').classList.toggle('hidden', !isSetting);
       document.getElementById('d365SubstockView').classList.toggle('hidden', !isD365Substock);
-      document.getElementById('menuDashboard').classList.toggle('active', isDashboard);
-      document.getElementById('menuSummary').classList.toggle('active', isSummary);
-      document.getElementById('menuSetting').classList.toggle('active', isSetting);
-      document.getElementById('menuD365Substock').classList.toggle('active', isD365Substock);
+      const menuDashboard = document.getElementById('menuDashboard');
+      const menuSummary = document.getElementById('menuSummary');
+      const menuSetting = document.getElementById('menuSetting');
+      const menuD365Substock = document.getElementById('menuD365Substock');
+      if (menuDashboard) menuDashboard.classList.toggle('active', isDashboard);
+      if (menuSummary) menuSummary.classList.toggle('active', isSummary);
+      if (menuSetting) menuSetting.classList.toggle('active', isSetting);
+      if (menuD365Substock) menuD365Substock.classList.toggle('active', isD365Substock);
       document.getElementById('pageHeader').classList.toggle('hidden', !isDashboard);
       if (isSetting) {
         setSettingTab('user');
         loadUsers();
       }
       if (isSummary) {
-        refreshSubconOptions();
         loadSummaryReport();
       }
       if (isD365Substock) {
@@ -2163,6 +2551,7 @@
 
     async function refreshSubconOptions() {
       const sel = document.getElementById('subconSelect');
+      if (!sel) return;
       const prev = sel.value;
       sel.disabled = true;
       sel.innerHTML = '<option value="__LOADING__" selected>Loading subcons...</option>';
@@ -2298,13 +2687,23 @@
 
     function boot() {
       const raw = sessionStorage.getItem(SESSION_KEY);
-      if (!raw) { window.location.href = 'login.html'; return; }
-      try {
-        currentUser = JSON.parse(raw);
-      } catch (_) {
-        sessionStorage.removeItem(SESSION_KEY);
-        window.location.href = 'login.html';
-        return;
+      if (RMT_PAGE_CONFIG.directAccess) {
+        currentUser = {
+          username: String(RMT_PAGE_CONFIG.directAccessUsername || 'G1P_PUBLIC'),
+          role: 'RMT',
+          subcon: ''
+        };
+        const logoutButton = document.getElementById('logoutButton');
+        if (logoutButton) logoutButton.style.display = 'none';
+      } else {
+        if (!raw) { window.location.href = 'login.html'; return; }
+        try {
+          currentUser = JSON.parse(raw);
+        } catch (_) {
+          sessionStorage.removeItem(SESSION_KEY);
+          window.location.href = 'login.html';
+          return;
+        }
       }
       if (!currentUser || currentUser.role !== 'RMT') {
         window.location.href = currentUser && currentUser.role === 'SUBCON' ? 'subcon.html' : 'login.html';
@@ -2313,27 +2712,29 @@
 
       document.getElementById('monthInput').value = getCurrentMonthValue();
       syncDashboardMonthInput();
+      initRmtTrendYearSelect();
 
       const sel = document.getElementById('subconSelect');
-      sel.innerHTML = '<option value="__LOADING__" selected>Loading subcons...</option>';
-      sel.disabled = true;
+      if (sel) {
+        sel.innerHTML = '<option value="__LOADING__" selected>Loading subcons...</option>';
+        sel.disabled = true;
+      }
       document.getElementById('monthInput').addEventListener('change', async () => {
         syncDashboardMonthInput();
         syncSummaryMonthInput();
         initSubstockMonth();
-        if (document.getElementById('menuD365Substock').classList.contains('active')) {
+        if (document.getElementById('menuD365Substock')?.classList.contains('active')) {
           const m = (document.getElementById('substockMonthInput')?.value || '').trim();
           if (m) await loadD365Substock(m);
         }
         updateDashboardTitle();
-        const dashPromise = loadDashboard(true);
-        const refreshPromise = refreshSubconOptions();
-        if (sel.value && sel.value !== '__SELECT__' && sel.value !== '__LOADING__') {
-          loadReport();
-          loadSummaryReport();
+        const dashboardActive = !document.getElementById('dashboardView').classList.contains('hidden');
+        const summaryActive = !document.getElementById('summaryView').classList.contains('hidden');
+        if (dashboardActive) {
+          await loadDashboard(true);
+          if (dashboardDisplayPanel === 'trend') await loadRmtTotalTrend();
         }
-        await refreshPromise;
-        await dashPromise;
+        if (summaryActive) await loadSummaryReport();
       });
       document.getElementById('dashboardMonthInput').addEventListener('change', async (e) => {
         const v = (e.target.value || '').trim();
@@ -2341,33 +2742,36 @@
         document.getElementById('monthInput').value = v;
         syncSummaryMonthInput();
         initSubstockMonth();
-        if (document.getElementById('menuD365Substock').classList.contains('active')) {
+        if (document.getElementById('menuD365Substock')?.classList.contains('active')) {
           const m = (document.getElementById('substockMonthInput')?.value || '').trim();
           if (m) await loadD365Substock(m);
         }
         updateDashboardTitle();
-        const dashPromise = loadDashboard(true);
-        const refreshPromise = refreshSubconOptions();
-        if (sel.value && sel.value !== '__SELECT__' && sel.value !== '__LOADING__') {
-          loadReport();
-          loadSummaryReport();
+        const dashboardActive = !document.getElementById('dashboardView').classList.contains('hidden');
+        const summaryActive = !document.getElementById('summaryView').classList.contains('hidden');
+        if (dashboardActive) {
+          await loadDashboard(true);
+          if (dashboardDisplayPanel === 'trend') await loadRmtTotalTrend();
         }
-        await refreshPromise;
-        await dashPromise;
+        if (summaryActive) await loadSummaryReport();
+      });
+      document.getElementById('rmtTrendYearSelect')?.addEventListener('change', () => {
+        if (dashboardDisplayPanel === 'trend') loadRmtTotalTrend();
       });
       document.getElementById('deadlineYearInput').addEventListener('change', () => {
         renderDeadlineGrid();
       });
-      sel.addEventListener('change', () => {
-        if (sel.value && sel.value !== '__SELECT__' && sel.value !== '__LOADING__') {
-          loadReport();
-          loadSummaryReport();
-        } else {
-          renderRows([]);
-          setSummaryDirtyState(false);
-          renderSummaryRows([]);
-        }
-      });
+      if (sel) {
+        sel.addEventListener('change', () => {
+          if (sel.value && sel.value !== '__SELECT__' && sel.value !== '__LOADING__') {
+            loadReport();
+          } else {
+            renderRows([]);
+            setSummaryDirtyState(false);
+            renderSummaryRows([]);
+          }
+        });
+      }
       document.getElementById('substockMonthInput').addEventListener('change', async () => {
         const m = (document.getElementById('substockMonthInput')?.value || '').trim();
         if (!m) return renderD365SubstockRows([]);
@@ -2377,13 +2781,21 @@
         updateDashboardTitle();
         await loadD365Substock(m);
       });
+      document.getElementById('summaryMonthInput')?.addEventListener('change', async (e) => {
+        const month = String(e.target.value || '').trim();
+        if (!month) return;
+        document.getElementById('monthInput').value = month;
+        syncDashboardMonthInput();
+        initSubstockMonth();
+        updateDashboardTitle();
+        await loadSummaryReport(month);
+      });
 
       setMenu('dashboard');
       updateDashboardTitle();
       syncDashboardMonthInput();
       syncSummaryMonthInput();
       initSubstockMonth();
-      refreshSubconOptions();
       bindSummaryDragScroll();
       bindD365FilterInputs();
       bindSummaryFilterInputs();
@@ -2392,16 +2804,3 @@
     }
 
     boot();
-  
-
-      document.getElementById('summaryMonthInput').addEventListener('change', async (e) => {
-        const v = (e.target.value || '').trim();
-        if (!v) return;
-        document.getElementById('monthInput').value = v;
-        syncDashboardMonthInput();
-        initSubstockMonth();
-        updateDashboardTitle();
-        const refreshPromise = refreshSubconOptions();
-        await loadSummaryReport();
-        await refreshPromise;
-      });

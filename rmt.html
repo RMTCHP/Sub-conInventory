@@ -10,6 +10,7 @@
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <link rel="stylesheet" href="rmt.css">
 </head>
 <body>
@@ -32,9 +33,15 @@
   <main class="content">
     <div id="pageHeader">
       <div class="section-title" id="dashboardTitle">RMT Dashboard (Monthly Inventory)</div>
-      <div class="dashboard-month-box">
-        <label for="dashboardMonthInput">Month</label>
-        <input id="dashboardMonthInput" type="month" class="form-control" />
+      <div class="dashboard-header-actions">
+        <div class="dashboard-month-box">
+          <label for="dashboardMonthInput">Month</label>
+          <input id="dashboardMonthInput" type="month" class="form-control" />
+        </div>
+        <div id="dashboardDeadlineStatus" class="dashboard-deadline">Deadline: -</div>
+        <button class="btn btn-secondary btn-sm dashboard-refresh-btn" title="Refresh Dashboard" onclick="refreshDashboard()">
+          <i class="fa-solid fa-rotate-right"></i>
+        </button>
       </div>
     </div>
 
@@ -75,17 +82,41 @@
         <span>Loading Dashboard...</span>
       </div>
 
-      <div class="quick-actions">
-        <div id="dashboardDeadlineStatus" class="dashboard-deadline">Deadline: -</div>
-        <button class="btn btn-secondary btn-sm" title="Refresh Dashboard" onclick="refreshDashboard()">
-          <i class="fa-solid fa-rotate-right"></i>
-        </button>
-      </div>
-
-      <div class="card">
-        <div class="card-title mb-2">Submission Status</div>
-        <div id="dashStatusCards" class="subcon-card-grid">
-          <div class="subcon-card">Loading data...</div>
+      <div class="card dashboard-display-card">
+        <div class="dashboard-tabs" role="tablist" aria-label="Dashboard display">
+          <button id="dashboardTabStatus" class="dashboard-tab active" type="button" onclick="switchDashboardPanel('status')">
+            <i class="fa-solid fa-list-check"></i> Submission Status
+          </button>
+          <button id="dashboardTabTrend" class="dashboard-tab" type="button" onclick="switchDashboardPanel('trend')">
+            <i class="fa-solid fa-chart-column"></i> Total Trend
+          </button>
+        </div>
+        <div id="dashboardStatusPanel">
+          <div class="card-title mb-2">Submission Status</div>
+          <div id="dashStatusCards" class="subcon-card-grid">
+            <div class="subcon-card">Loading data...</div>
+          </div>
+        </div>
+        <div id="dashboardTrendPanel" class="hidden">
+          <div class="dashboard-trend-head">
+            <div>
+              <div class="card-title mb-0">Total Trend</div>
+              <div id="rmtTrendYearLabel" class="dashboard-trend-sub">-</div>
+            </div>
+            <div class="trend-year-picker">
+              <label for="rmtTrendYearSelect">Year</label>
+              <select id="rmtTrendYearSelect" class="form-select form-select-sm" aria-label="Total trend year"></select>
+            </div>
+          </div>
+          <div id="rmtTrendSubconLegend" class="rmt-trend-subcon-legend" aria-label="Subcon visibility"></div>
+          <div class="rmt-trend-metric-controls" aria-label="Metric visibility">
+            <button id="rmtTrendTotalToggle" class="trend-metric-toggle active" type="button" onclick="toggleRmtTrendMetric('total')">Total</button>
+            <button id="rmtTrendAccuracyToggle" class="trend-metric-toggle active" type="button" onclick="toggleRmtTrendMetric('accuracy')">%Accuracy</button>
+          </div>
+          <div id="rmtTrendLoading" class="dashboard-trend-loading hidden">Loading total trend...</div>
+          <div class="dashboard-trend-chart-wrap">
+            <canvas id="rmtTotalTrendChart"></canvas>
+          </div>
         </div>
       </div>
     </div>
@@ -117,10 +148,11 @@
             <col style="width:6%;">
             <col style="width:7%;">
             <col style="width:8%;">
+            <col style="width:7%;">
             <col style="width:8%;">
             <col style="width:7%;">
             <col style="width:7%;">
-            <col style="width:24%;">
+            <col style="width:17%;">
           </colgroup>
           <thead>
             <tr>
@@ -131,10 +163,11 @@
               <th>Delivery</th>
               <th>NG</th>
               <th>EOH</th>
-              <th>Supplier confirm OK</th>
+              <th>Supplier confirm RM/WIP</th>
+              <th>Supplier confirm FG</th>
               <th>Supplier confirm Hold</th>
               <th>Total</th>
-              <th>Diff</th>
+              <th>Delta +/-</th>
               <th style="min-width:260px;">Remark</th>
             </tr>
           </thead>
@@ -149,6 +182,7 @@
               <td id="sumNg">-</td>
               <td id="sumEoh">-</td>
               <td id="sumConfirmOk">-</td>
+              <td id="sumConfirmFg">-</td>
               <td id="sumConfirmHold">-</td>
               <td id="sumTotal">-</td>
               <td id="sumDiff">-</td>
@@ -201,23 +235,25 @@
         </table>
       </div>
       <div class="table-wrap summary-wrap">
-        <table class="summary-table" style="min-width:1800px;">
+        <table class="summary-table" style="min-width:1880px;">
           <thead>
             <tr>
               <th class="summary-filter-head" data-filter-key="item">Item</th>
               <th class="summary-filter-head" data-filter-key="fileNo">File No.</th>
               <th class="summary-filter-head" data-filter-key="d365Code">D365 code</th>
               <th class="summary-filter-head" data-filter-key="d365Qty">D365 Q'ty</th>
+              <th>Actual</th>
               <th class="summary-filter-head" data-filter-key="d365Diff">Diff</th>
               <th class="summary-filter-head" data-filter-key="boh">BOH</th>
               <th class="summary-filter-head" data-filter-key="supply">Supply</th>
               <th class="summary-filter-head" data-filter-key="delivery">Delivery</th>
               <th class="summary-filter-head" data-filter-key="ng" style="background:#fef08a; color:#111827;">NG</th>
               <th class="summary-filter-head" data-filter-key="eoh">EOH</th>
-              <th class="summary-filter-head" data-filter-key="confirmOk">OK</th>
+              <th class="summary-filter-head" data-filter-key="confirmOk">RM/WIP</th>
+              <th class="summary-filter-head" data-filter-key="confirmFg">FG</th>
               <th class="summary-filter-head" data-filter-key="confirmHold">Hold</th>
               <th class="summary-filter-head" data-filter-key="total">Total</th>
-              <th class="summary-filter-head" data-filter-key="diff">Diff</th>
+              <th class="summary-filter-head" data-filter-key="diff">Delta +/-</th>
               <th class="summary-filter-head" data-filter-key="remark">Remark</th>
               <th class="summary-filter-head" data-filter-key="subcon">SUBC</th>
               <th>Total D365</th>
@@ -287,7 +323,7 @@
         </div>
         <div class="card hidden" id="settingDeadlinePanel">
           <div class="deadline-head">
-            <div class="card-title mb-0">Set monthly submission deadline for each Subcon</div>
+            <div class="card-title mb-0">Set monthly submission deadline for all Subcons</div>
             <div class="d-flex align-items-center gap-2">
               <div class="year-nav">
                 <button class="year-nav-btn" type="button" title="Previous year" onclick="shiftDeadlineYear(-1)">&#8249;</button>
